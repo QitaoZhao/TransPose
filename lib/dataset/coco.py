@@ -65,13 +65,16 @@ class COCODataset(JointsDataset):
         self.image_height = cfg.MODEL.IMAGE_SIZE[1]
         self.aspect_ratio = self.image_width * 1.0 / self.image_height
         self.pixel_std = 200
+        # ---------------------- Written by Qitao Zhao ---------------------- 
+        self.max_num_objs = cfg.DATASET.MAX_NUM_OBJS # Maximum number of objects in the image
+        # -------------------------------------------------------------------
 
         self.coco = COCO(self._get_ann_file_keypoint())
 
         # deal with class names
         cats = [cat['name']
                 for cat in self.coco.loadCats(self.coco.getCatIds())]
-        self.classes = ['__background__'] + cats
+        self.classes = ['__background__'] + cats # ['__background__', 'person']
         logger.info('=> classes: {}'.format(self.classes))
         self.num_classes = len(self.classes)
         self._class_to_ind = dict(zip(self.classes, range(self.num_classes)))
@@ -138,7 +141,10 @@ class COCODataset(JointsDataset):
         """ ground truth bbox and keypoints """
         gt_db = []
         for index in self.image_set_index:
-            gt_db.extend(self._load_coco_keypoint_annotation_kernal(index))
+            if self.target_type == 'gaussian':
+                gt_db.extend(self._load_coco_keypoint_annotation_kernal(index))
+            else:
+                gt_db.extend(self._my_load_coco_keypoint_annotation_kernal(index))
         return gt_db
 
     def _load_coco_keypoint_annotation_kernal(self, index):
@@ -205,6 +211,87 @@ class COCODataset(JointsDataset):
                 'filename': '',
                 'imgnum': 0,
             })
+
+        return rec
+
+    def _my_load_coco_keypoint_annotation_kernal(self, index):
+        """
+         ----------------------
+        |Written by Qitao Zhao |
+         ----------------------
+        coco ann: [u'segmentation', u'area', u'iscrowd', u'image_id', u'bbox', u'category_id', u'id']
+        iscrowd:
+            crowd instances are handled by marking their overlaps with all categories to -1
+            and later excluded in training
+        bbox:
+            [x1, y1, w, h]
+        :param index: coco image id
+        :return: db entry
+        """
+        im_ann = self.coco.loadImgs(index)[0]
+        width = im_ann['width']
+        height = im_ann['height']
+
+        annIds = self.coco.getAnnIds(imgIds=index, iscrowd=False)
+        objs = self.coco.loadAnns(annIds)
+
+        # sanitize bboxes
+        valid_objs = []
+        for obj in objs:
+            x, y, w, h = obj['bbox']
+            x1 = np.max((0, x))
+            y1 = np.max((0, y))
+            x2 = np.min((width - 1, x1 + np.max((0, w - 1))))
+            y2 = np.min((height - 1, y1 + np.max((0, h - 1))))
+            if obj['area'] > 0 and x2 >= x1 and y2 >= y1:
+                obj['clean_bbox'] = [x1, y1, x2-x1+1, y2-y1+1]
+                valid_objs.append(obj)
+        objs = valid_objs
+
+        rec = []
+        joints_3d_all = np.zeros((1, self.num_joints, 3), dtype=np.float)
+        joints_3d_vis_all = np.zeros((1, self.num_joints, 3), dtype=np.float)
+        for obj in objs:
+            cls = self._coco_ind_to_class_ind[obj['category_id']]
+            if cls != 1:
+                continue
+
+            # ignore objs without keypoints annotation
+            if max(obj['keypoints']) == 0:
+                continue
+
+            joints_3d = np.zeros((1, self.num_joints, 3), dtype=np.float)
+            joints_3d_vis = np.zeros((1, self.num_joints, 3), dtype=np.float)
+            for ipt in range(self.num_joints):
+                joints_3d[0, ipt, 0] = obj['keypoints'][ipt * 3 + 0]
+                joints_3d[0, ipt, 1] = obj['keypoints'][ipt * 3 + 1]
+                joints_3d[0, ipt, 2] = 0
+                t_vis = obj['keypoints'][ipt * 3 + 2]
+                if t_vis > 1:
+                    t_vis = 1
+                joints_3d_vis[0, ipt, 0] = t_vis
+                joints_3d_vis[0, ipt, 1] = t_vis
+                joints_3d_vis[0, ipt, 2] = 0
+
+            joints_3d_all = np.concatenate((joints_3d_all, joints_3d), axis=0)
+            joints_3d_vis_all = np.concatenate((joints_3d_vis_all, joints_3d_vis), axis=0)
+
+        num_objs = joints_3d_all.shape[0] - 1
+        center = np.array((width/2., height/2.), dtype=np.float32)
+        scale = np.array(
+            [self.image_size[0] * 1.0 / self.pixel_std, self.image_size[1] * 1.0 / self.pixel_std],
+            dtype=np.float32)
+
+        rec.append({
+            'image': self.image_path_from_index(index),
+            'center': center,
+            'scale': scale,
+            'joints_3d': joints_3d_all[1:, :, :],
+            'joints_3d_vis': joints_3d_vis_all[1:, :, :],
+            'num_objs': num_objs,
+            'filename': '',
+            'imgnum': 0,
+        })
 
         return rec
 
@@ -317,7 +404,7 @@ class COCODataset(JointsDataset):
         # image x person x (keypoints)
         kpts = defaultdict(list)
         for kpt in _kpts:
-            kpts[kpt['image']].append(kpt)
+            kpts[kpt['image']].append(kpt) # put persons in the same image together.
 
         # rescoring and oks nms
         num_joints = self.num_joints

@@ -138,6 +138,10 @@ class JointsDataset(Dataset):
         joints = db_rec['joints_3d']
         joints_vis = db_rec['joints_3d_vis']
 
+        # ---------------------- Written by Qitao Zhao ----------------------
+        num_objs = db_rec['num_objs'] if 'num_objs' in db_rec else 0
+        # -------------------------------------------------------------------
+
         c = db_rec['center']
         s = db_rec['scale']
         score = db_rec['score'] if 'score' in db_rec else 1
@@ -178,12 +182,22 @@ class JointsDataset(Dataset):
         if self.transform:
             input = self.transform(input)
 
-        for i in range(self.num_joints):
-            if joints_vis[i, 0] > 0.0:
-                joints[i, 0:2] = affine_transform(joints[i, 0:2], trans)
-                joints_heatmap[i, 0:2] = affine_transform(joints_heatmap[i, 0:2], trans_heatmap)
+        if self.target_type == 'gaussian':
+            for i in range(self.num_joints):
+                if joints_vis[i, 0] > 0.0:
+                    joints[i, 0:2] = affine_transform(joints[i, 0:2], trans)
+                    joints_heatmap[i, 0:2] = affine_transform(joints_heatmap[i, 0:2], trans_heatmap)
 
-        target, target_weight = self.generate_target(joints_heatmap, joints_vis)
+            target, target_weight = self.generate_target(joints_heatmap, joints_vis)
+        # ---------------------- Written by Qitao Zhao ---------------------- 
+        else:
+            for i in range(num_objs):
+                for j in range(self.num_joints):
+                    if joints_vis[i, j, 0] > 0.0:
+                        joints[i, j, 0:2] = affine_transform(joints[i, j, 0:2], trans)
+
+            target, target_weight = self.my_generate_target(joints, joints_vis)
+        # -------------------------------------------------------------------
 
         target = torch.from_numpy(target)
         target_weight = torch.from_numpy(target_weight)
@@ -194,6 +208,7 @@ class JointsDataset(Dataset):
             'imgnum': imgnum,
             'joints': joints,
             'joints_vis': joints_vis,
+            'num_objs': num_objs,
             'center': c,
             'scale': s,
             'rotation': r,
@@ -235,7 +250,6 @@ class JointsDataset(Dataset):
         logger.info('=> num selected db: {}'.format(len(db_selected)))
         return db_selected
 
-
     def generate_target(self, joints, joints_vis):
         '''
         :param joints:  [num_joints, 3]
@@ -245,40 +259,88 @@ class JointsDataset(Dataset):
         target_weight = np.ones((self.num_joints, 1), dtype=np.float32)
         target_weight[:, 0] = joints_vis[:, 0]
 
-        assert self.target_type == 'gaussian', \
-            'Only support gaussian map now!'
+        # assert self.target_type == 'gaussian', \
+        #     'Only support gaussian map now!'
 
-        if self.target_type == 'gaussian':
-            target = np.zeros((self.num_joints,
-                               self.heatmap_size[1],
-                               self.heatmap_size[0]),
-                              dtype=np.float32)
+        target = np.zeros((self.num_joints,
+                           self.heatmap_size[1],
+                           self.heatmap_size[0]),
+                          dtype=np.float32)
 
-            tmp_size = self.sigma * 3
+        tmp_size = self.sigma * 3
 
-            for joint_id in range(self.num_joints):
-                target_weight[joint_id] = \
-                    self.adjust_target_weight(joints[joint_id], target_weight[joint_id], tmp_size)
-                
-                if target_weight[joint_id] == 0:
-                    continue
+        for joint_id in range(self.num_joints):
+            target_weight[joint_id] = \
+                self.adjust_target_weight(joints[joint_id], target_weight[joint_id], tmp_size)
+            
+            if target_weight[joint_id] == 0:
+                continue
 
-                mu_x = joints[joint_id][0]
-                mu_y = joints[joint_id][1]
-                
-                x = np.arange(0, self.heatmap_size[0], 1, np.float32)
-                y = np.arange(0, self.heatmap_size[1], 1, np.float32)
-                y = y[:, np.newaxis]
+            mu_x = joints[joint_id][0]
+            mu_y = joints[joint_id][1]
+            
+            x = np.arange(0, self.heatmap_size[0], 1, np.float32)
+            y = np.arange(0, self.heatmap_size[1], 1, np.float32)
+            y = y[:, np.newaxis]
 
-                v = target_weight[joint_id]
-                if v > 0.5:
-                    target[joint_id] = np.exp(- ((x - mu_x) ** 2 + (y - mu_y) ** 2) / (2 * self.sigma ** 2))
+            v = target_weight[joint_id]
+            if v > 0.5:
+                target[joint_id] = np.exp(- ((x - mu_x) ** 2 + (y - mu_y) ** 2) / (2 * self.sigma ** 2))
 
         if self.use_different_joints_weight:
             target_weight = np.multiply(target_weight, self.joints_weight)
 
         return target, target_weight
 
+    def my_generate_target(self, joints, joints_vis):
+        '''
+         ----------------------
+        |Written by Qitao Zhao |
+         ----------------------
+        :0 ~ 999: joint location; 1000: confidence (binary)
+        :param joints:  [num_objs, num_joints, 3]
+        :param joints_vis: [num_objs, num_joints, 3]
+        :return: target, target_weight(1: visible, 0: invisible)
+        '''
+        num_objs = joints.shape[0]
+        target_weight = np.ones((num_objs, self.num_joints, 1), dtype=np.float32)
+        target_weight[:, :, 0] = joints_vis[:, :, 0]
+
+        # assert self.target_type == 'gaussian', \
+        #     'Only support gaussian map now!'
+
+        target = np.zeros((self.num_joints,
+                           self.heatmap_size[1],
+                           self.heatmap_size[0]),
+                          dtype=np.float32)
+
+        for obj_id in range(self.num_objs):
+            for joint_id in range(self.num_joints):
+                if target_weight[obj_id, joint_id] == 0:
+                    continue
+
+                target_weight[obj_id, joint_id] = \
+                    self.my_adjust_target_weight(joints[obj_id, joint_id])
+
+                # mu_x = joints[obj_id, joint_id][0]
+                # mu_y = joints[obj_id, joint_id][1]
+                
+                # x = np.arange(0, self.heatmap_size[0], 1, np.float32)
+                # y = np.arange(0, self.heatmap_size[1], 1, np.float32)
+                # y = y[:, np.newaxis]
+
+                # v = target_weight[joint_id]
+                # if v > 0.5:
+                #     target[joint_id] = np.exp(- ((x - mu_x) ** 2 + (y - mu_y) ** 2) / (2 * self.sigma ** 2))
+        # elif self.target_type == 'joint':
+        #     target = np.zeros((self.num_joints, 2),
+        #                       dtype=np.float32)
+        #     target = joints[:, :2]
+
+        if self.use_different_joints_weight:
+            target_weight = np.multiply(target_weight, self.joints_weight)
+
+        return target, target_weight
 
     def adjust_target_weight(self, joint, target_weight, tmp_size):
         # feat_stride = self.image_size / self.heatmap_size
@@ -289,6 +351,21 @@ class JointsDataset(Dataset):
         br = [int(mu_x + tmp_size + 1), int(mu_y + tmp_size + 1)]
         if ul[0] >= self.heatmap_size[0] or ul[1] >= self.heatmap_size[1] \
                 or br[0] < 0 or br[1] < 0:
+            # If not, just return the image as is
+            target_weight = 0
+
+        return target_weight
+
+    def my_adjust_target_weight(self, joint):
+        '''
+         ----------------------
+        |Written by Qitao Zhao |
+         ----------------------
+        '''
+        x = joint[0]
+        y = joint[1]
+        # Check that any part of the joint is in-bounds
+        if (x < 0 or x > self.image_size[0]) or (y < 0 or y > self.image_size[1]):
             # If not, just return the image as is
             target_weight = 0
 
