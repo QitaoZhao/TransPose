@@ -104,13 +104,15 @@ class Bottleneck(nn.Module):
 
 class TransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers,
-                 norm=None, pe_only_at_begin=False, return_atten_map=False):
+                 norm=None, pe_only_at_begin=False, return_atten_map=False, epsilon=0.0):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.pe_only_at_begin = pe_only_at_begin
         self.return_atten_map = return_atten_map
+        self.epsilon = epsilon # Margine for objectness.
+        self.sigmoid = nn.Sigmoid() # Activation for objectness.
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -124,7 +126,7 @@ class TransformerEncoder(nn.Module):
                 pos: Optional[Tensor] = None):
         output = src
         atten_maps_list = []
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers): # 0,1,2,3 [192, 20, 256]
             if self.return_atten_map:
                 output, att_map = layer(output, src_mask=mask, pos=pos,
                                         src_key_padding_mask=src_key_padding_mask)
@@ -135,6 +137,8 @@ class TransformerEncoder(nn.Module):
 
             # only add position embedding to the first atttention layer
             pos = None if self.pe_only_at_begin else pos
+
+            objectness = self.sigmoid(output[:, :, 0]) # Calculate objectness for each token.
 
         if self.norm is not None:
             output = self.norm(output)
@@ -238,14 +242,15 @@ class TransformerEncoderLayer(nn.Module):
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
 
-class TransPoseR(nn.Module):
+class POTR(nn.Module):
 
     def __init__(self, block, layers, cfg, **kwargs):
         self.inplanes = 64
         extra = cfg.MODEL.EXTRA
         self.deconv_with_bias = extra.DECONV_WITH_BIAS
+        self.epsilon = cfg.MODEL.EPSILON
 
-        super(TransPoseR, self).__init__()
+        super(POTR, self).__init__()
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
@@ -261,7 +266,7 @@ class TransPoseR(nn.Module):
         pos_embedding_type = cfg.MODEL.POS_EMBEDDING
         w, h = cfg.MODEL.IMAGE_SIZE
 
-        self.reduce = nn.Conv2d(self.inplanes, d_model, 1, bias=False)
+        self.reduce = nn.Conv2d(self.inplanes, d_model, 2, stride=2, bias=False) # Change output size.
         self._make_position_embedding(w, h, d_model, pos_embedding_type)
 
         encoder_layer = TransformerEncoderLayer(
@@ -274,24 +279,26 @@ class TransPoseR(nn.Module):
         self.global_encoder = TransformerEncoder(
             encoder_layer,
             encoder_layers_num,
-            return_atten_map=False
+            return_atten_map=False,
+            epsilon=self.epsilon
         )
 
         # used for deconv layers
         self.inplanes = d_model
-        self.deconv_layers = self._make_deconv_layer(
-            extra.NUM_DECONV_LAYERS,   # 1
-            extra.NUM_DECONV_FILTERS,  # [d_model]
-            extra.NUM_DECONV_KERNELS,  # [4]
-        )
+        # self.deconv_layers = self._make_deconv_layer(
+        #     extra.NUM_DECONV_LAYERS,   # 1
+        #     extra.NUM_DECONV_FILTERS,  # [d_model]
+        #     extra.NUM_DECONV_KERNELS,  # [4]
+        # )
 
-        self.final_layer = nn.Conv2d(
-            in_channels=d_model,
-            out_channels=cfg.MODEL.NUM_JOINTS,
-            kernel_size=extra.FINAL_CONV_KERNEL,
-            stride=1,
-            padding=1 if extra.FINAL_CONV_KERNEL == 3 else 0
-        )
+        # self.final_layer = nn.Conv2d(
+        #     in_channels=d_model,
+        #     out_channels=cfg.MODEL.NUM_JOINTS,
+        #     kernel_size=extra.FINAL_CONV_KERNEL,
+        #     stride=1,
+        #     padding=1 if extra.FINAL_CONV_KERNEL == 3 else 0
+        # )
+        self.proj = nn.Linear(d_model, 17*2) # Add a final projection layer.
 
     def _make_position_embedding(self, w, h, d_model, pe_type='sine'):
         assert pe_type in ['none', 'learnable', 'sine']
@@ -406,15 +413,17 @@ class TransPoseR(nn.Module):
         x = self.maxpool(x)
 
         x = self.layer1(x)
-        x = self.layer2(x)
+        x = self.layer2(x) # [20, 512, 32, 24]
         x = self.reduce(x)
 
-        bs, c, h, w = x.shape # [20, 256, 32, 24]
-        x = x.flatten(2).permute(2, 0, 1) # [768, 20, 256]
-        x = self.global_encoder(x, pos=self.pos_embedding) # [768, 20, 256]
-        x = x.permute(1, 2, 0).contiguous().view(bs, c, h, w) # [20, 256, 32, 24]
-        x = self.deconv_layers(x) # [20, 256, 64, 48]
-        x = self.final_layer(x) # [20, 17, 64, 48]
+        bs, c, h, w = x.shape # [20, 256, 16, 12]
+        x = x.flatten(2).permute(2, 0, 1) # [192, 20, 256]
+        x = self.global_encoder(x, pos=self.pos_embedding) # [192, 20, 256]
+        x = x.permute(1, 0, 2).contiguous() # [20, 192, 256]
+        # x = x.permute(1, 2, 0).contiguous().view(bs, c, h, w) # [20, 256, 32, 24]
+        # x = self.deconv_layers(x) # [20, 256, 64, 48]
+        # x = self.final_layer(x) # [20, 17, 64, 48]
+        x = self.proj(x) # [20, 192, 17*2]
 
         return x
 
@@ -463,7 +472,7 @@ resnet_spec = {18: (BasicBlock, [2, 2, 2, 2]),
 def get_pose_net(cfg, is_train, **kwargs):
     num_layers = cfg.MODEL.EXTRA.NUM_LAYERS
     block_class, layers = resnet_spec[num_layers]
-    model = TransPoseR(block_class, layers, cfg, **kwargs)
+    model = POTR(block_class, layers, cfg, **kwargs)
 
     if is_train and cfg.MODEL.INIT_WEIGHTS:
         model.init_weights(cfg.MODEL.PRETRAINED)
